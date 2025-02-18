@@ -1,15 +1,2 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
 .env
-venv/
-.env/
-
-# IDE
-.vscode/
-.idea/
-
-# Системные файлы
-.DS_Store
+.db
