@@ -1,14 +1,16 @@
 import os
+import uvicorn
 from dotenv import load_dotenv
 import asyncio
 import logging
 import aiohttp
-import random
-import aiosqlite  # Импортируем библиотеку для асинхронной работы с SQLite
+import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message
 from aiogram.filters import Command
 from aiogram.enums import ChatAction
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
 
 # --- Загрузка переменных окружения ---
 load_dotenv()
@@ -17,49 +19,72 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = os.getenv("OWNER_ID")
 DB_FILE = "users_data.db"
 
-
 # --- Проверка наличия токенов ---
 if not BOT_TOKEN:
     raise ValueError("Необходимо установить переменную окружения BOT_TOKEN")
 if not GEMINI_API_KEY:
     raise ValueError("Необходимо установить переменную окружения GEMINI_API_KEY")
 
-# --- Логирование ---
-logging.basicConfig(level=logging.INFO)
+# --- Настройка логирования ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# --- Инициализация бота и диспетчера ---
+# --- Инициализация объектов ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- Функции для работы с БД ---
-async def create_database():
-    async with aiosqlite.connect(DB_FILE) as conn:
-        cursor = await conn.cursor()
-        await cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER,
-                message TEXT
-            )
-        ''')
-        await conn.commit()
+# --- Lifespan менеджер для FastAPI ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Инициализация базы данных
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER,
+                    message TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await conn.commit()
+        logger.info("База данных успешно инициализирована")
+    except Exception as e:
+        logger.critical(f"Ошибка инициализации БД: {e}")
+        raise
 
+    # Запуск бота в фоновом режиме
+    asyncio.create_task(start_bot())
+    yield
+
+    # Завершение работы
+    await bot.session.close()
+    logger.info("Приложение корректно завершает работу")
+
+app = FastAPI(lifespan=lifespan)
+
+# --- Функции для работы с БД ---
 async def save_user_request(user_id, message):
-    async with aiosqlite.connect(DB_FILE) as conn:
-        cursor = await conn.cursor()
-        
-        # Проверяем на дубликаты
-        await cursor.execute("SELECT COUNT(*) FROM users WHERE user_id = ? AND message = ?", (user_id, message))
-        if (await cursor.fetchone())[0] > 0:
-            return  # Сообщение уже сохранено
-        
-        await cursor.execute("INSERT INTO users (user_id, message) VALUES (?, ?)", (user_id, message))
-        await conn.commit()
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute(
+                "INSERT INTO users (user_id, message) VALUES (?, ?)",
+                (user_id, message)
+            )
+            await conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка сохранения данных: {e}")
 
 async def get_users_count():
-    async with aiosqlite.connect(DB_FILE) as conn:
-        cursor = await conn.cursor()
-        await cursor.execute("SELECT COUNT(DISTINCT user_id) FROM users")
-        return (await cursor.fetchone())[0]
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            cursor = await conn.execute("SELECT COUNT(DISTINCT user_id) FROM users")
+            return (await cursor.fetchone())[0]
+    except Exception as e:
+        logger.error(f"Ошибка получения данных: {e}")
+        return 0
 
 # --- Функция запроса к Gemini ---
 async def get_gemini_response(message_text):
@@ -68,83 +93,69 @@ async def get_gemini_response(message_text):
     data = {"contents": [{"parts": [{"text": message_text}]}]}
 
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.post(url, headers=headers, json=data) as response:
-                response.raise_for_status()  # Проверка на ошибки HTTP
+                response.raise_for_status()
                 result = await response.json()
-
-                if 'candidates' in result and result['candidates']:
-                    return result['candidates'][0]['content']['parts'][0]['text']
-                return "Gemini не дал ответа."
-                
-    except aiohttp.ClientError as e:
-        logging.error(f"Ошибка при запросе к Gemini API: {e}")
-        return "Ошибка запроса к Gemini API. Пожалуйста, попробуйте позже."
-        
-    except asyncio.TimeoutError:
-        logging.error("Время ожидания запроса к Gemini API истекло.")
-        return "Запрос к Gemini API занял слишком много времени. Попробуйте еще раз."
-        
+                return result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "Не удалось получить ответ")
     except Exception as e:
-        logging.exception("Необработанная ошибка при получении ответа Gemini:")
-        return "Произошла ошибка при обработке вашего запроса."
-
-# --- Логирование действий пользователей (функция) ---
-def log_user_action(user_id, action):
-    logging.info(f"Пользователь {user_id} выполнил действие: {action}")
+        logger.error(f"Ошибка Gemini API: {str(e)}")
+        return "Извините, произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже."
 
 # --- Обработчики команд ---
 @dp.message(Command(commands=["start", "help"]))
 async def handle_commands(message: Message):
-    command = message.text.lower()
-    log_user_action(message.from_user.id, command)  # Логируем действие пользователя
-
-    if command == "/start":
-        user_first_name = message.from_user.first_name or "пользователь"
-        await message.answer(f"Добро пожаловать, {user_first_name}! Чем могу вам помоч?")
+    try:
+        command = message.text.split()[0].lower()
+        logger.info(f"User {message.from_user.id} executed {command}")
         
-    elif command == "/help":
-        await message.answer(
-            "Я бот, который отвечает на ваши вопросы с помощью Gemini Pro.\n\n"
-            "Доступные команды:\n"
-            "/start - Начать диалог\n"
-            "/help - Помощь\n"
-        )
-        
-# --- Обработчик для кнопки "Задать вопрос" ---
-@dp.message(F.text == "Задать вопрос")
-async def ask_question(message: Message):
-    await message.answer("Пожалуйста, задайте ваш вопрос.")
+        if command == "/start":
+            await message.answer(f"Добро пожаловать, {message.from_user.first_name}! Чем могу помочь?")
+        elif command == "/help":
+            await message.answer(
+                "🤖 Я бот с интеграцией Gemini Pro\n\n"
+                "Доступные команды:\n"
+                "/start - Начало работы\n"
+                "/help - Это сообщение\n"
+                "/stats - Статистика пользователей"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка обработки команды: {e}")
 
 # --- Обработчик текстовых сообщений ---
 @dp.message(F.text)
 async def handle_message(message: Message):
-    if message.text.lower() == "задать вопрос":
-        await ask_question(message)
-        return
-    
     try:
-        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)  # Отправляем индикатор "печатает"
-        
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
         await save_user_request(message.from_user.id, message.text)
-        
-        reply = await get_gemini_response(message.text)
-        
-        await message.reply(reply)
-        
+        response = await get_gemini_response(message.text)
+        await message.reply(response)
     except Exception as e:
-        logging.exception("Необработанная ошибка при обработке сообщения:")
-        await message.answer(f"Произошла ошибка при обработке запроса: {e}")
+        logger.error(f"Ошибка обработки сообщения: {e}")
+        await message.answer("⚠️ Произошла ошибка при обработке вашего запроса")
 
+# --- FastAPI Endpoints ---
+@app.get("/")
+async def health_check():
+    return {
+        "status": "running",
+        "users": await get_users_count()
+    }
 
 # --- Запуск бота ---
-async def main():
-   await create_database()  # Создаем БД при запуске
-   print("Бот запущен!")
-   try:
-       await dp.start_polling(bot)
-   finally:
-       await bot.session.close()  # Закрываем сессию бота
+async def start_bot():
+    try:
+        logger.info("Запуск бота...")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.critical(f"Фатальная ошибка бота: {e}")
+        await bot.session.close()
+        os._exit(1)
 
 if __name__ == "__main__":
-   asyncio.run(main())
+    uvicorn.run(
+        app="bot:app",  # Убедитесь что имя файла совпадает (если файл называется run.py, укажите "run:app")
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        reload=True
+    )
